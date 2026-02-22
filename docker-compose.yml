@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  rail-db:
+    image: postgres:16-alpine
+    container_name: brazil_rail_db_container
+    environment:
+      POSTGRES_DB: brazil_rail_db
+      POSTGRES_USER: rail_admin
+      POSTGRES_PASSWORD: rail_password_007
+      POSTGRES_INITDB_ARGS: "--locale-provider=icu --icu-locale=pt-BR"
+    ports:
+      - "5434:5432"
+    volumes:
+      - rail_system_data:/var/lib/postgresql/data
+      - ./database/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rail_admin -d brazil_rail_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - rail_network
+
+  rail-pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: brazil_rail_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@brazilrail.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5051:80"
+    depends_on:
+      rail-db:
+        condition: service_healthy
+    networks:
+      - rail_network
+
+  rail-redis:
+    image: redis:7-alpine
+    container_name: brazil_rail_redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - rail_redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - rail_network
+
+volumes:
+  rail_system_data:
+    driver: local
+  rail_redis_data:
+    driver: local
+
+networks:
+  rail_network:
+    driver: bridge
