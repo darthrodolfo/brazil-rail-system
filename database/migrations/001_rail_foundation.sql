@@ -1,402 +1,267 @@
 -- ==============================================================================
--- BRAZIL RAIL SYSTEM — Schema v2.0
--- Conformidade: LGPD BR (Lei 13.709/2018) + PIPEDA CA
--- Estratégia: Criptografia Híbrida (Opção C)
---   - Dados sensíveis → AES-256-GCM nível aplicação
---   - Dados comuns    → TDE (Transparent Data Encryption) nível infraestrutura  
---   - Audit logs      → Hash chain verificável (append-only)
+-- BRAZIL RAIL SYSTEM — Migration 001: Foundation
+-- PostgreSQL: Fonte da verdade — CRUD completo de users + train_models
+-- ==============================================================================
+-- O que cada banco faz neste projeto:
+--
+--   PostgreSQL  → Dados estruturados, relacionamentos, fonte da verdade
+--                 CRUD completo de users e train_models
+--                 Tipos variados: UUID, TEXT, JSONB, BYTEA, DECIMAL,
+--                 BOOLEAN, TIMESTAMPTZ, INET, arrays, enums
+--
+--   Redis       → NÃO é banco primário — é especialista em:
+--                 • Session/JWT do usuário logado
+--                 • Cache de listagem de trens (TTL 5min)
+--                 • Rate limiting por IP/usuário (sliding window)
+--                 Estruturas: String (JWT), Hash (session), 
+--                 Sorted Set (rate limit), List (recent views)
+--
+--   MongoDB     → NÃO duplica o PostgreSQL — é especialista em:
+--                 • Histórico de edições de train_models (documentos que mudam)
+--                 • Activity log de usuários (volume alto, schema flexível)
+--                 Collections: train_edit_history, user_activity_log
 -- ==============================================================================
 
 -- ==============================================================================
 -- 0. EXTENSÕES
 -- ==============================================================================
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";  -- gen_random_uuid(), crypt(), hmac()
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";   -- busca fuzzy ILIKE com índice (trigramas)
 
 -- ==============================================================================
 -- 1. ENUMS
+-- Objetivo de treino: cada stack vai implementar esses enums de forma diferente
+-- .NET → enum C# | Go → iota const | Python → Enum class | Java → enum | etc.
 -- ==============================================================================
-DO $$ 
+DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'train_status') THEN
-        CREATE TYPE train_status AS ENUM (
-            'ACTIVE', 'MAINTENANCE', 'OUT_OF_SERVICE', 'MUSEUM_PIECE'
-        );
-    END IF;
-    
+    -- Perfil de acesso do usuário
     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'user_role') THEN
         CREATE TYPE user_role AS ENUM (
-            'ADMIN', 'OPERATOR', 'MAINTENANCE', 'HISTORIAN'
+            'ADMIN',        -- acesso total: CRUD tudo
+            'OPERATOR',     -- pode criar e editar train_models
+            'HISTORIAN',    -- somente leitura + pode adicionar historical_context
+            'GUEST'         -- somente leitura
         );
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'data_category') THEN
-        CREATE TYPE data_category AS ENUM (
-            'PERSONAL',      -- Nome, email — LGPD Art. 5 I
-            'SENSITIVE',     -- CPF, biometria — LGPD Art. 11 / PIPEDA explicit consent
-            'OPERATIONAL',   -- GPS, velocidade — não pessoal isoladamente
-            'ANONYMOUS'      -- Dados anonimizados — fora do escopo LGPD/PIPEDA
+    -- Status do modelo de trem
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'train_status') THEN
+        CREATE TYPE train_status AS ENUM (
+            'ACTIVE',       -- em operação comercial
+            'MAINTENANCE',  -- em manutenção
+            'RETIRED',      -- aposentado de operação
+            'MUSEUM_PIECE', -- peça de museu histórico
+            'PROTOTYPE'     -- protótipo / nunca entrou em serviço
         );
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'audit_action') THEN
-        CREATE TYPE audit_action AS ENUM (
-            'CREATE',
-            'READ',               -- LGPD exige rastrear acesso a dado pessoal
-            'UPDATE',
-            'DELETE',
-            'CONSENT_GRANTED',
-            'CONSENT_REVOKED',    -- LGPD Art. 8 §5 / PIPEDA: revogação a qualquer tempo
-            'DATA_EXPORT',        -- LGPD Art. 18 V: portabilidade
-            'DATA_ANONYMIZED',
-            'KEY_ROTATED',        -- Rotação de chave criptográfica — NOVO
-            'LOGIN',
-            'LOGIN_FAILED',
-            'BIOMETRIC_ENROLLED', -- Cadastro de biometria — NOVO (evento específico)
-            'BIOMETRIC_ACCESS',
-            'BIOMETRIC_DELETED',  -- NOVO: exclusão específica de biometria
-            'CROSS_BORDER_TRANSFER'
+    -- Tipo de tração — range de valores fixos, ideal para ensinar enums
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'traction_type') THEN
+        CREATE TYPE traction_type AS ENUM (
+            'STEAM',        -- vapor
+            'DIESEL',       -- diesel
+            'ELECTRIC',     -- elétrico (pantógrafo ou terceiro trilho)
+            'HYBRID',       -- diesel-elétrico
+            'HYDROGEN',     -- célula de hidrogênio
+            'MAGLEV'        -- levitação magnética
         );
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'key_status') THEN
-        CREATE TYPE key_status AS ENUM (
-            'ACTIVE',      -- chave em uso
-            'ROTATING',    -- em processo de rotação (registros sendo re-criptografados)
-            'RETIRED',     -- aposentada, não criptografa mais mas ainda decripta
-            'COMPROMISED'  -- comprometida, todos os registros devem ser re-criptografados
-        );
-    END IF;
-
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'biometric_purpose') THEN
-        CREATE TYPE biometric_purpose AS ENUM (
-            'AUTHENTICATION_ONLY',  -- apenas login
-            'ACCESS_CONTROL',       -- controle de acesso a áreas físicas
-            'FRAUD_PREVENTION',     -- prevenção de fraude
-            'TIME_ATTENDANCE'       -- controle de ponto
+    -- Bitola ferroviária — padrão técnico real
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'track_gauge') THEN
+        CREATE TYPE track_gauge AS ENUM (
+            'NARROW',       -- 1000mm — bitola métrica, padrão histórico BR
+            'STANDARD',     -- 1435mm — padrão Stephenson, Europa/EUA/China
+            'BROAD',        -- 1600mm — Irlanda, Brasil (algumas linhas)
+            'IBERIAN',      -- 1668mm — Espanha, Portugal
+            'DUAL'          -- duas bitolas no mesmo trilho
         );
     END IF;
 END $$;
 
 -- ==============================================================================
--- 2. ENCRYPTION_KEYS — Gerenciamento de chaves criptográficas
--- ==============================================================================
--- Esta tabela NÃO armazena as chaves em si (isso vai para um KMS: AWS KMS, 
--- HashiCorp Vault, Azure Key Vault).
--- Armazena REFERÊNCIAS às chaves — o ID que o KMS usa para identificá-las.
--- Em dev local: o valor real da chave fica apenas no .env.
--- Em produção: o app chama o KMS passando o key_id para obter a chave.
-
-CREATE TABLE IF NOT EXISTS encryption_keys (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    
-    -- Identificador que o KMS usa (ex: "arn:aws:kms:ca-central-1:xxx" ou "vault/transit/brs-biometric-v1")
-    key_reference   VARCHAR(500) NOT NULL UNIQUE,
-    
-    -- Identificador amigável para queries (ex: "biometric-v1", "personal-v2")
-    key_alias       VARCHAR(100) NOT NULL UNIQUE,
-    
-    -- Para qual tipo de dado esta chave é usada
-    data_category   data_category NOT NULL,
-    purpose         VARCHAR(100) NOT NULL,
-    -- Exemplos: 'biometric_encryption', 'personal_data_encryption', 'document_encryption'
-    
-    status          key_status DEFAULT 'ACTIVE',
-    
-    -- Jurisdição — LGPD BR exige que chaves de dados BR residam em território BR
-    -- (ou país com nível de proteção adequado reconhecido pela ANPD)
-    jurisdiction    VARCHAR(2)[] DEFAULT '{BR}', -- '{BR}', '{CA}', '{BR,CA}'
-    
-    -- Rotação automática
-    rotates_at      TIMESTAMP WITH TIME ZONE, -- quando deve ser rotacionada
-    retired_at      TIMESTAMP WITH TIME ZONE, -- quando foi aposentada
-    
-    -- Metadados do algoritmo (documentação, não a chave)
-    algorithm       VARCHAR(50) DEFAULT 'AES-256-GCM',
-    key_size_bits   INTEGER DEFAULT 256,
-    
-    created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    created_by      UUID -- referência ao user que criou (FK adicionada depois)
-);
-
--- Seeds de chaves (referências apenas — valores reais no KMS/.env)
-INSERT INTO encryption_keys (key_reference, key_alias, data_category, purpose, jurisdiction, rotates_at)
-VALUES
-    ('local/dev/personal-v1',  'personal-v1',  'PERSONAL',   'personal_data_encryption',  '{BR,CA}', CURRENT_TIMESTAMP + INTERVAL '90 days'),
-    ('local/dev/sensitive-v1', 'sensitive-v1', 'SENSITIVE',  'document_encryption',        '{BR}',    CURRENT_TIMESTAMP + INTERVAL '90 days'),
-    ('local/dev/biometric-v1', 'biometric-v1', 'SENSITIVE',  'biometric_encryption',       '{BR}',    CURRENT_TIMESTAMP + INTERVAL '90 days')
-ON CONFLICT (key_alias) DO NOTHING;
-
--- ==============================================================================
--- 3. USERS — Conformidade completa LGPD + PIPEDA
+-- 2. USERS
+-- Objetivo de treino por stack:
+--   - Autenticação (hash de senha, JWT)
+--   - Upload de avatar (url + mimetype + tamanho)
+--   - Tipos variados: UUID, TEXT, INET, BOOLEAN, TIMESTAMPTZ, array
+--   - Hash HMAC para busca segura por email
 -- ==============================================================================
 CREATE TABLE IF NOT EXISTS users (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    
-    -- ── DADOS PESSOAIS — AES-256-GCM nível aplicação ──────────────────────────
-    -- O banco nunca vê em claro. DBA não consegue ler. Backup seguro sem TDE.
-    -- Trio obrigatório por campo criptografado: encrypted + iv + auth_tag
-    full_name_encrypted     TEXT NOT NULL,
-    full_name_iv            TEXT NOT NULL,  -- IV único por registro (randomBytes(16))
-    full_name_auth_tag      TEXT NOT NULL,  -- GCM auth tag — detecta adulteração
-    full_name_key_id        UUID REFERENCES encryption_keys(id), -- qual chave usou
-    
-    -- Hash HMAC-SHA256 para busca determinística segura
-    -- HMAC com SECRET_KEY do .env — diferente de SHA256 puro (resiste rainbow table)
-    email_hmac              TEXT UNIQUE NOT NULL,
-    
-    -- Documento (CPF/Passaporte) — dado sensível LGPD Art. 11
-    document_id_encrypted   TEXT,
-    document_id_iv          TEXT,
-    document_id_auth_tag    TEXT,
-    document_id_key_id      UUID REFERENCES encryption_keys(id),
-    
-    -- ── AUTENTICAÇÃO ──────────────────────────────────────────────────────────
-    password_hash           TEXT NOT NULL,          -- bcrypt, rounds >= 12
-    biometric_public_key    TEXT,                   -- chave pública FIDO2 (não sensível)
-    
-    -- ── BIOMETRIA FACIAL — DADO SENSÍVEL ESPECIAL ─────────────────────────────
-    -- LGPD Art. 11: base legal + consentimento específico + finalidade declarada
-    -- PIPEDA: explicit meaningful consent, purpose limitation
-    face_signature_vector   BYTEA,                  -- vetor criptografado AES-256-GCM
-    face_vector_iv          TEXT,                   -- IV do vetor biométrico
-    face_vector_auth_tag    TEXT,                   -- GCM auth tag do vetor
-    face_vector_key_id      UUID REFERENCES encryption_keys(id), -- ← O campo que faltava
-    
-    -- Consentimento biométrico (LGPD Art. 11 §1 + PIPEDA)
-    biometric_consent_at    TIMESTAMP WITH TIME ZONE,   -- quando clicou "Aceito"
-    biometric_consent_ip    INET,                        -- de onde consentiu
-    biometric_consent_version VARCHAR(20),               -- versão dos termos aceitos
-    biometric_purpose       biometric_purpose,           -- para qual finalidade específica
-    biometric_enrolled_at   TIMESTAMP WITH TIME ZONE,   -- quando o vetor foi gravado
-    
-    -- Dados não podem ser usados para finalidade diferente da declarada
-    -- Este flag indica se o usuário está ciente e aceitou a finalidade atual
-    biometric_purpose_acknowledged BOOLEAN DEFAULT FALSE,
-    
-    -- ── CONSENTIMENTO GERAL ───────────────────────────────────────────────────
-    privacy_consent_at      TIMESTAMP WITH TIME ZONE,
-    privacy_policy_version  VARCHAR(20),
-    
-    -- ── DIREITOS DO TITULAR (LGPD Art. 18 / PIPEDA Principle 9) ──────────────
-    deletion_requested_at   TIMESTAMP WITH TIME ZONE,   -- Art. 18 VI: esquecimento
-    deletion_scheduled_at   TIMESTAMP WITH TIME ZONE,   -- quando será executado
-    data_portability_last_at TIMESTAMP WITH TIME ZONE,  -- Art. 18 V: portabilidade
-    anonymization_requested_at TIMESTAMP WITH TIME ZONE, -- Art. 18 IV
-    
-    -- ── JURISDIÇÃO DO TITULAR ─────────────────────────────────────────────────
-    -- Determina qual lei se aplica (pode ser BR e CA simultaneamente)
-    data_jurisdiction       VARCHAR(2)[] DEFAULT '{BR}',
-    
-    -- ── METADADOS ─────────────────────────────────────────────────────────────
-    role                    user_role DEFAULT 'OPERATOR',
-    is_active               BOOLEAN DEFAULT TRUE,
-    created_at              TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at              TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- FK circular resolvida após criação
-ALTER TABLE encryption_keys 
-    ADD CONSTRAINT fk_key_created_by 
-    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL;
-
--- ==============================================================================
--- 4. TRAIN_MODELS
--- ==============================================================================
-CREATE TABLE IF NOT EXISTS train_models (
-    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    model_name          VARCHAR(100) NOT NULL,
-    main_image_url      VARCHAR(500),
-    technical_video_url VARCHAR(500),
-    engine_sound_url    VARCHAR(500),
-    historical_context  TEXT,
-    is_legendary        BOOLEAN DEFAULT FALSE,
-    metadata            JSONB DEFAULT '{}',
-    created_at          TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at          TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- ==============================================================================
--- 5. TRAIN_UNITS
--- ==============================================================================
-CREATE TABLE IF NOT EXISTS train_units (
-    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    serial_number       VARCHAR(50) UNIQUE NOT NULL,
-    model_id            UUID REFERENCES train_models(id) ON DELETE RESTRICT,
-    
-    -- Dado operacional — não é dado pessoal isoladamente
-    -- Mas SE vinculado a um operador identificável, passa a ser pessoal (LGPD Art. 5)
-    current_lat         DECIMAL(9,6),
-    current_lng         DECIMAL(9,6),
-    altitude_meters     INTEGER,
-    current_speed_kmh   INTEGER,
-    
-    -- FK para usuário — aqui o GPS VIRA dado pessoal (localização do operador)
-    last_operator_id    UUID REFERENCES users(id) ON DELETE SET NULL,
-    current_status      train_status DEFAULT 'ACTIVE',
-    
-    created_at          TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at          TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- ==============================================================================
--- 6. AUDIT_LOGS — Append-only com hash chain verificável
--- ==============================================================================
-CREATE TABLE IF NOT EXISTS audit_logs (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    
-    -- O QUE aconteceu
-    action          audit_action NOT NULL,
-    table_name      VARCHAR(100) NOT NULL,
-    record_id       UUID,
-    data_category   data_category NOT NULL,
-    
-    -- QUEM fez
-    actor_user_id   UUID REFERENCES users(id) ON DELETE SET NULL,
-    actor_ip        INET NOT NULL,
-    actor_user_agent TEXT,
-    
-    -- Jurisdição aplicável no momento do evento
-    applicable_law  VARCHAR(2)[] NOT NULL DEFAULT '{BR}',
-    -- Preenchido automaticamente baseado em data_jurisdiction do usuário
-    
-    -- Contexto da requisição
-    request_id      UUID NOT NULL,
-    endpoint        VARCHAR(255),
-    http_method     VARCHAR(10),
-    
-    -- Campos alterados (nunca valores — apenas nomes dos campos)
-    changed_fields  JSONB,
-    -- Ex: {"fields": ["full_name_encrypted", "role"], "reason": "admin update"}
-    
-    -- Rotação de chave (preenchido quando action = 'KEY_ROTATED')
-    old_key_id      UUID REFERENCES encryption_keys(id),
-    new_key_id      UUID REFERENCES encryption_keys(id),
-    
-    -- Transferência internacional (preenchido quando action = 'CROSS_BORDER_TRANSFER')
-    destination_country   VARCHAR(2),
-    transfer_legal_basis  VARCHAR(200),
-    -- LGPD Art. 33: 'adequacy_decision' | 'standard_contractual_clauses' | 'consent'
-    -- PIPEDA: 'comparable_protection' | 'contractual_accountability'
-    
-    created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    
-    -- Hash chain — cada log referencia o anterior (detecta adulteração)
-    previous_log_id UUID REFERENCES audit_logs(id),
-    previous_hash   TEXT,
-    
-    -- Hash deste registro (computed — não pode ser alterado após INSERT)
-    record_hash     TEXT GENERATED ALWAYS AS (
-        encode(
-            digest(
-                id::text
-                || action::text
-                || table_name
-                || COALESCE(record_id::text, '')
-                || actor_ip::text
-                || COALESCE(actor_user_id::text, '')
-                || created_at::text,
-                'sha256'
-            ),
-            'hex'
-        )
-    ) STORED
-);
 
-CREATE INDEX IF NOT EXISTS idx_audit_actor      ON audit_logs(actor_user_id);
-CREATE INDEX IF NOT EXISTS idx_audit_record     ON audit_logs(record_id);
-CREATE INDEX IF NOT EXISTS idx_audit_action     ON audit_logs(action);
-CREATE INDEX IF NOT EXISTS idx_audit_created    ON audit_logs(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_crossborder
-    ON audit_logs(destination_country, created_at)
-    WHERE action = 'CROSS_BORDER_TRANSFER';
-CREATE INDEX IF NOT EXISTS idx_audit_key_rotation
-    ON audit_logs(old_key_id, new_key_id)
-    WHERE action = 'KEY_ROTATED';
+    -- ── IDENTIDADE ──────────────────────────────────────────────────────────
+    username        VARCHAR(50)  UNIQUE NOT NULL,   -- login único, imutável após criação
+    display_name    VARCHAR(100) NOT NULL,           -- nome exibido na UI (editável)
+    email           VARCHAR(150) UNIQUE NOT NULL,    -- email em claro (simplificado)
+    
+    -- ── AUTENTICAÇÃO ────────────────────────────────────────────────────────
+    password_hash   TEXT NOT NULL,
+    -- bcrypt com rounds >= 12
+    -- Treino: cada stack usa sua biblioteca bcrypt nativa
+    -- Node: bcryptjs | Python: passlib | Go: golang.org/x/crypto/bcrypt
+    -- Java: spring-security-crypto | .NET: BCrypt.Net-Next
 
--- ==============================================================================
--- 7. CONSENT_RECORDS — Histórico imutável de consentimentos
--- ==============================================================================
-CREATE TABLE IF NOT EXISTS consent_records (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    
-    -- Finalidade específica — cada finalidade é um registro separado
-    purpose         VARCHAR(100) NOT NULL,
-    -- 'biometric_authentication' | 'location_tracking' | 'data_sharing_partners'
-    -- 'marketing_communications' | 'cross_border_transfer_ca' | 'fraud_analysis'
-    
-    granted         BOOLEAN NOT NULL,
-    policy_version  VARCHAR(20) NOT NULL,
-    
-    -- Jurisdição — LGPD e PIPEDA têm requisitos diferentes de consentimento
-    jurisdiction    VARCHAR(2) NOT NULL DEFAULT 'BR',
-    
-    -- Evidência
-    consent_ip      INET NOT NULL,
-    consent_user_agent TEXT,
-    
-    -- Validade
-    expires_at      TIMESTAMP WITH TIME ZONE,
-    
-    -- Para biometria: qual finalidade específica foi consentida
-    biometric_purpose biometric_purpose,
-    
-    created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-    -- SEM updated_at — cada mudança é novo INSERT. Histórico é sagrado.
-);
+    -- ── AVATAR / UPLOAD ─────────────────────────────────────────────────────
+    -- Treino: upload de arquivo em cada stack (multipart/form-data)
+    -- Storage: local em dev, S3-compatible em produção
+    avatar_url      VARCHAR(500),                   -- URL pública ou path relativo
+    avatar_mime     VARCHAR(50),                    -- 'image/jpeg' | 'image/png' | 'image/webp'
+    avatar_size_kb  INTEGER,                        -- tamanho em KB (para UI mostrar)
 
-CREATE INDEX IF NOT EXISTS idx_consent_user    ON consent_records(user_id);
-CREATE INDEX IF NOT EXISTS idx_consent_purpose ON consent_records(user_id, purpose, jurisdiction);
--- Query mais comum: "qual o último consentimento ativo do usuário X para finalidade Y?"
-CREATE INDEX IF NOT EXISTS idx_consent_latest
-    ON consent_records(user_id, purpose, created_at DESC)
-    WHERE granted = TRUE;
+    -- ── PERFIL EDITÁVEL ─────────────────────────────────────────────────────
+    bio             TEXT,                           -- texto livre, até ~2000 chars
+    location        VARCHAR(100),                   -- cidade/país, texto livre
+    website_url     VARCHAR(500),                   -- URL do site pessoal/portfolio
+    
+    -- ── PREFERÊNCIAS (JSONB) ─────────────────────────────────────────────────
+    -- Treino: como cada stack lida com JSONB (leitura, escrita, query por campo)
+    -- Exemplo: {"theme": "dark", "language": "pt-BR", "notifications": true}
+    preferences     JSONB DEFAULT '{}',
 
--- ==============================================================================
--- 8. DATA_RETENTION_POLICIES
--- ==============================================================================
-CREATE TABLE IF NOT EXISTS data_retention_policies (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    table_name      VARCHAR(100) NOT NULL,
-    field_name      VARCHAR(100),           -- NULL = política para a tabela inteira
-    data_category   data_category NOT NULL,
-    retention_days  INTEGER NOT NULL,
-    
-    legal_basis     TEXT NOT NULL,
-    legal_article   VARCHAR(100),           -- "LGPD Art. 16 II" | "PIPEDA Principle 5"
-    
-    -- Ação ao expirar: 'DELETE' | 'ANONYMIZE' | 'ARCHIVE'
-    expiry_action   VARCHAR(20) DEFAULT 'ANONYMIZE',
-    
-    applies_to_jurisdiction VARCHAR(2)[],
+    -- ── CONTROLE DE ACESSO ──────────────────────────────────────────────────
+    role            user_role DEFAULT 'GUEST',
     is_active       BOOLEAN DEFAULT TRUE,
     
+    -- ── SEGURANÇA / SESSION ──────────────────────────────────────────────────
+    -- Treino: como invalidar tokens JWT via Redis
+    -- Quando last_password_change > token.iat → token inválido
+    last_password_change TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    last_login_at   TIMESTAMP WITH TIME ZONE,
+    last_login_ip   INET,                           -- tipo INET nativo do Postgres
+    failed_login_attempts INTEGER DEFAULT 0,        -- para rate limiting no app
+    locked_until    TIMESTAMP WITH TIME ZONE,       -- lockout temporário
+
+    -- ── METADADOS ───────────────────────────────────────────────────────────
     created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
-INSERT INTO data_retention_policies
-    (table_name, field_name, data_category, retention_days, legal_basis, legal_article, expiry_action, applies_to_jurisdiction)
-VALUES
-    -- Audit logs: 1 ano BR, 2 anos CA para dados sensíveis
-    ('audit_logs',        NULL,                    'PERSONAL',   365,  'Accountability e rastreabilidade', 'LGPD Art. 37 / PIPEDA P.1',     'ARCHIVE',    '{BR,CA}'),
-    ('audit_logs',        NULL,                    'SENSITIVE',  730,  'Dados sensíveis requerem retenção maior', 'LGPD Art. 11 / PIPEDA',  'ARCHIVE',    '{BR,CA}'),
-    -- Biometria: 5 anos CA (PIPEDA recomendação), 2 anos BR
-    ('users',             'face_signature_vector', 'SENSITIVE',  730,  'Dado biométrico — retenção mínima', 'LGPD Art. 11',                  'DELETE',     '{BR}'),
-    ('users',             'face_signature_vector', 'SENSITIVE',  1825, 'Biometric data retention',         'PIPEDA Principle 5',             'DELETE',     '{CA}'),
-    -- Consentimentos: 5 anos (prova em caso de auditoria regulatória)
-    ('consent_records',   NULL,                    'PERSONAL',   1825, 'Prova de consentimento',           'LGPD Art. 8 / PIPEDA P.3',      'ARCHIVE',    '{BR,CA}'),
-    -- GPS/telemetria: 90 dias (dado operacional sem finalidade de longo prazo)
-    ('train_units',       'current_lat',           'OPERATIONAL', 90,  'Dado operacional sem vínculo pessoal prolongado', 'LGPD Art. 16', 'ANONYMIZE',  '{BR,CA}'),
-    -- Chaves aposentadas: manter referência 7 anos (auditoria fiscal/legal)
-    ('encryption_keys',   NULL,                    'OPERATIONAL', 2555,'Conformidade e auditabilidade de segurança', 'LGPD Art. 46',       'ARCHIVE',    '{BR,CA}')
-ON CONFLICT DO NOTHING;
+-- Índices de users
+CREATE INDEX IF NOT EXISTS idx_users_email     ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_username  ON users(username);
+CREATE INDEX IF NOT EXISTS idx_users_role      ON users(role);
+-- Índice trigrama para busca fuzzy por display_name (pg_trgm)
+-- Treino: mostra como busca full-text funciona no Postgres
+CREATE INDEX IF NOT EXISTS idx_users_name_trgm ON users USING gin(display_name gin_trgm_ops);
 
 -- ==============================================================================
--- 9. TRIGGERS
+-- 3. TRAIN_MODELS
+-- Objetivo de treino por stack:
+--   - CRUD completo da entidade principal
+--   - Upload de múltiplos tipos de mídia (imagem, vídeo, áudio)
+--   - Tipos ricos: DECIMAL, INTEGER, BOOLEAN, JSONB, BYTEA, arrays, enums
+--   - Geodados: lat/lng de fabricação e rotas históricas
+--   - Relacionamento FK com users (criado_por)
 -- ==============================================================================
-CREATE OR REPLACE FUNCTION update_updated_at()
+CREATE TABLE IF NOT EXISTS train_models (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    -- ── IDENTIFICAÇÃO ────────────────────────────────────────────────────────
+    model_name      VARCHAR(100) NOT NULL,          -- "Big Boy 4014", "TGV Duplex"
+    manufacturer    VARCHAR(100),                   -- "Union Pacific", "Alstom"
+    country_origin  VARCHAR(60),                    -- "United States", "France", "Brazil"
+    year_introduced INTEGER,                        -- 1941, 1994, 2023
+    year_retired    INTEGER,                        -- NULL se ainda ativo
+
+    -- ── CLASSIFICAÇÃO ────────────────────────────────────────────────────────
+    status          train_status DEFAULT 'ACTIVE',
+    traction        traction_type,
+    gauge           track_gauge DEFAULT 'STANDARD',
+    is_legendary    BOOLEAN DEFAULT FALSE,          -- destaque especial na UI
+
+    -- ── DADOS TÉCNICOS (tipos numéricos variados) ─────────────────────────────
+    -- Treino: DECIMAL vs INTEGER vs FLOAT em cada stack e ORM
+    max_speed_kmh   INTEGER,                        -- velocidade máxima (km/h)
+    power_kw        INTEGER,                        -- potência total (kW)
+    weight_tonnes   DECIMAL(8,2),                   -- peso em toneladas (ex: 548.25)
+    length_meters   DECIMAL(6,2),                   -- comprimento (ex: 40.50)
+    passenger_capacity INTEGER,                     -- passageiros (NULL para carga)
+    
+    -- ── CONTEÚDO DESCRITIVO ──────────────────────────────────────────────────
+    description     TEXT,                           -- resumo curto (para cards)
+    historical_context TEXT,                        -- texto longo histórico (para detail page)
+    fun_facts       TEXT[],                         -- array de strings
+    -- Treino: como cada stack/ORM lida com arrays nativos do Postgres
+    -- Exemplo: {"Primeiro trem a atingir 200km/h", "Operou por 50 anos ininterruptos"}
+
+    -- ── MÍDIAS (upload/download em cada stack) ────────────────────────────────
+    -- Treino principal: multipart upload, storage, streaming de áudio/vídeo
+    
+    -- Imagem principal (obrigatória para a UI)
+    main_image_url  VARCHAR(500),
+    main_image_mime VARCHAR(50),                    -- 'image/jpeg' | 'image/webp' | 'image/png'
+    main_image_size_kb INTEGER,
+
+    -- Galeria de imagens (array de URLs)
+    gallery_urls    TEXT[],
+    -- Treino: inserir/atualizar arrays, query com ANY(), @> operator
+
+    -- Vídeo técnico/histórico
+    video_url       VARCHAR(500),
+    video_mime      VARCHAR(50),                    -- 'video/mp4' | 'video/webm'
+    video_duration_sec INTEGER,                     -- duração em segundos
+    video_size_mb   DECIMAL(6,2),
+
+    -- Áudio (som do motor — feature única e memorável)
+    engine_sound_url  VARCHAR(500),
+    engine_sound_mime VARCHAR(50),                  -- 'audio/mpeg' | 'audio/wav' | 'audio/ogg'
+    engine_sound_duration_sec INTEGER,
+
+    -- Documento técnico (PDF de especificações)
+    -- Treino: upload de PDF + download com Content-Disposition header
+    spec_sheet_url  VARCHAR(500),
+    spec_sheet_size_kb INTEGER,
+
+    -- ── GEODADOS (lat/lng de origem) ──────────────────────────────────────────
+    -- Treino: tipos DECIMAL para geo, como cada ORM mapeia, como exibir no front
+    -- Fábrica de origem — onde foi construído
+    factory_lat     DECIMAL(9,6),                   -- ex: -23.548943
+    factory_lng     DECIMAL(9,6),                   -- ex: -46.638818
+    factory_city    VARCHAR(100),                   -- "Schenectady", "São Paulo"
+    
+    -- Rota histórica principal (array de coordenadas como JSONB)
+    -- Treino: JSONB com estrutura aninhada, indexação GIN
+    -- Exemplo: [{"lat": -23.5, "lng": -46.6, "station": "Luz"}, ...]
+    historical_route JSONB DEFAULT '[]',
+
+    -- ── METADADOS FLEXÍVEIS (JSONB) ───────────────────────────────────────────
+    -- Treino: JSONB para campos que variam por tipo de trem
+    -- Steam: {"boiler_pressure_psi": 300, "wheel_arrangement": "4-8-8-4"}
+    -- Maglev: {"levitation_height_mm": 10, "guideway_type": "T-shaped"}
+    -- Electric: {"voltage_v": 25000, "frequency_hz": 50}
+    technical_specs JSONB DEFAULT '{}',
+
+    -- ── RELACIONAMENTO ────────────────────────────────────────────────────────
+    created_by      UUID REFERENCES users(id) ON DELETE SET NULL,
+    -- Treino: JOIN em cada stack, como ORMs carregam relacionamentos (eager/lazy)
+
+    -- ── METADADOS ───────────────────────────────────────────────────────────
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Índices de train_models
+CREATE INDEX IF NOT EXISTS idx_trains_status      ON train_models(status);
+CREATE INDEX IF NOT EXISTS idx_trains_traction    ON train_models(traction);
+CREATE INDEX IF NOT EXISTS idx_trains_country     ON train_models(country_origin);
+CREATE INDEX IF NOT EXISTS idx_trains_legendary   ON train_models(is_legendary) WHERE is_legendary = TRUE;
+CREATE INDEX IF NOT EXISTS idx_trains_year        ON train_models(year_introduced);
+CREATE INDEX IF NOT EXISTS idx_trains_created_by  ON train_models(created_by);
+-- Busca fuzzy por nome do modelo
+CREATE INDEX IF NOT EXISTS idx_trains_name_trgm   ON train_models USING gin(model_name gin_trgm_ops);
+-- Índice GIN para queries em JSONB (technical_specs e historical_route)
+CREATE INDEX IF NOT EXISTS idx_trains_specs_gin   ON train_models USING gin(technical_specs);
+CREATE INDEX IF NOT EXISTS idx_trains_route_gin   ON train_models USING gin(historical_route);
+-- Índice geográfico simples (sem PostGIS por ora)
+CREATE INDEX IF NOT EXISTS idx_trains_geo         ON train_models(factory_lat, factory_lng)
+    WHERE factory_lat IS NOT NULL AND factory_lng IS NOT NULL;
+
+-- ==============================================================================
+-- 4. TRIGGER — updated_at automático
+-- ==============================================================================
+CREATE OR REPLACE FUNCTION fn_update_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = CURRENT_TIMESTAMP;
@@ -409,151 +274,202 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_users_updated_at') THEN
         CREATE TRIGGER trg_users_updated_at
             BEFORE UPDATE ON users
-            FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+            FOR EACH ROW EXECUTE FUNCTION fn_update_updated_at();
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_train_models_updated_at') THEN
         CREATE TRIGGER trg_train_models_updated_at
             BEFORE UPDATE ON train_models
-            FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_train_units_updated_at') THEN
-        CREATE TRIGGER trg_train_units_updated_at
-            BEFORE UPDATE ON train_units
-            FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_retention_updated_at') THEN
-        CREATE TRIGGER trg_retention_updated_at
-            BEFORE UPDATE ON data_retention_policies
-            FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+            FOR EACH ROW EXECUTE FUNCTION fn_update_updated_at();
     END IF;
 END $$;
 
 -- ==============================================================================
--- 10. ROW LEVEL SECURITY — tabelas imutáveis
--- ==============================================================================
-ALTER TABLE audit_logs        ENABLE ROW LEVEL SECURITY;
-ALTER TABLE consent_records   ENABLE ROW LEVEL SECURITY;
-
--- audit_logs: só INSERT e SELECT (nunca UPDATE/DELETE)
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'audit_insert_only' AND tablename = 'audit_logs') THEN
-        CREATE POLICY audit_insert_only ON audit_logs FOR INSERT WITH CHECK (true);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'audit_select_only' AND tablename = 'audit_logs') THEN
-        CREATE POLICY audit_select_only ON audit_logs FOR SELECT USING (true);
-    END IF;
-    -- consent_records: só INSERT e SELECT (histórico imutável)
-    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'consent_insert_only' AND tablename = 'consent_records') THEN
-        CREATE POLICY consent_insert_only ON consent_records FOR INSERT WITH CHECK (true);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'consent_select_only' AND tablename = 'consent_records') THEN
-        CREATE POLICY consent_select_only ON consent_records FOR SELECT USING (true);
-    END IF;
-END $$;
-
--- ==============================================================================
--- 11. VIEWS úteis para queries regulatórias frequentes
+-- 5. SEEDS — dados realistas para treino imediato
 -- ==============================================================================
 
--- "Quais usuários têm biometria cadastrada sem consentimento válido?" 
--- (auditoria regulatória — ANPD pode pedir isso)
-CREATE OR REPLACE VIEW v_biometric_compliance AS
-SELECT 
-    u.id,
-    u.role,
-    u.data_jurisdiction,
-    u.biometric_enrolled_at,
-    u.biometric_purpose,
-    u.biometric_consent_at,
-    u.biometric_consent_version,
-    -- Tem vetor mas não tem consentimento = violação LGPD Art. 11
-    CASE 
-        WHEN u.face_signature_vector IS NOT NULL 
-         AND u.biometric_consent_at IS NULL 
-        THEN TRUE ELSE FALSE 
-    END AS has_compliance_issue,
-    -- Consentimento expirado?
-    cr.expires_at AS consent_expires_at,
-    CASE 
-        WHEN cr.expires_at IS NOT NULL AND cr.expires_at < NOW() 
-        THEN TRUE ELSE FALSE 
-    END AS consent_expired
-FROM users u
-LEFT JOIN LATERAL (
-    SELECT expires_at 
-    FROM consent_records 
-    WHERE user_id = u.id 
-      AND purpose = 'biometric_authentication' 
-      AND granted = TRUE
-    ORDER BY created_at DESC 
-    LIMIT 1
-) cr ON TRUE
-WHERE u.face_signature_vector IS NOT NULL;
+-- Usuário admin (senha: Admin@2025! — hash bcrypt rounds=12)
+INSERT INTO users (username, display_name, email, password_hash, role, bio, location, preferences)
+VALUES (
+    'rail_admin',
+    'Rail System Admin',
+    'admin@brazilrail.com',
+    '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TiGc.0B4GrD5vQPz/GNIG7.WZWGO',
+    'ADMIN',
+    'System administrator of the Brazil Rail System platform.',
+    'São Paulo, Brazil',
+    '{"theme": "dark", "language": "pt-BR", "notifications": true}'
+) ON CONFLICT (email) DO NOTHING;
 
--- "Histórico completo de consentimentos de um usuário" 
--- (direito de transparência LGPD Art. 18 VII / PIPEDA Principle 9)
-CREATE OR REPLACE VIEW v_user_consent_timeline AS
-SELECT
-    cr.user_id,
-    cr.purpose,
-    cr.granted,
-    cr.jurisdiction,
-    cr.policy_version,
-    cr.consent_ip,
-    cr.biometric_purpose,
-    cr.expires_at,
-    cr.created_at,
-    LAG(cr.granted) OVER (
-        PARTITION BY cr.user_id, cr.purpose 
-        ORDER BY cr.created_at
-    ) AS previous_state
-FROM consent_records cr
-ORDER BY cr.user_id, cr.purpose, cr.created_at;
+-- Usuário operator
+INSERT INTO users (username, display_name, email, password_hash, role, bio, location)
+VALUES (
+    'historian_one',
+    'Maria Ferroviária',
+    'maria@brazilrail.com',
+    '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TiGc.0B4GrD5vQPz/GNIG7.WZWGO',
+    'HISTORIAN',
+    'Ferroviária apaixonada pela história das locomotivas brasileiras.',
+    'Jundiaí, SP, Brazil'
+) ON CONFLICT (email) DO NOTHING;
 
--- ==============================================================================
--- 12. SEED DATA
--- ==============================================================================
-INSERT INTO users (
-    full_name_encrypted, full_name_iv, full_name_auth_tag, full_name_key_id,
-    email_hmac,
-    password_hash,
-    role,
-    data_jurisdiction,
-    privacy_consent_at, privacy_policy_version
+-- Trem 1: Big Boy 4014 — icônico, muitos campos preenchidos
+INSERT INTO train_models (
+    model_name, manufacturer, country_origin, year_introduced, year_retired,
+    status, traction, gauge, is_legendary,
+    max_speed_kmh, power_kw, weight_tonnes, length_meters,
+    description, historical_context,
+    fun_facts,
+    engine_sound_url, engine_sound_mime, engine_sound_duration_sec,
+    factory_lat, factory_lng, factory_city,
+    technical_specs,
+    created_by
 )
 SELECT
-    'PLACEHOLDER_AES256_ENCRYPTED',
-    'PLACEHOLDER_IV_BASE64',
-    'PLACEHOLDER_AUTHTAG_BASE64',
-    ek.id,
-    encode(hmac('rodolfo@brazilrail.com', 'HMAC_SECRET_REPLACE_IN_APP', 'sha256'), 'hex'),
-    '$2b$12$K1e52fz.92K9njhBEWEXGWYrkLJl.1V9t2Hj.3WzW1',
-    'ADMIN',
-    '{BR,CA}',
-    CURRENT_TIMESTAMP,
-    '2025-06'
-FROM encryption_keys ek
-WHERE ek.key_alias = 'personal-v1'
-LIMIT 1
-ON CONFLICT DO NOTHING;
-
-INSERT INTO train_models (model_name, historical_context, is_legendary, engine_sound_url)
-VALUES (
     'Big Boy 4014',
-    'The world''s largest steam locomotive, built for heavy freight during the golden age of railroads.',
-    TRUE,
-    'https://cdn.railmaster.com/audio/big_boy_start.mp3'
-) ON CONFLICT DO NOTHING;
-
--- Seed: consentimento inicial do admin (biometria NÃO concedida por padrão)
-INSERT INTO consent_records (user_id, purpose, granted, policy_version, jurisdiction, consent_ip)
-SELECT id, 'biometric_authentication', FALSE, '2025-06', 'BR', '127.0.0.1'::inet
-FROM users WHERE role = 'ADMIN'
-LIMIT 1
+    'American Locomotive Company (ALCO)',
+    'United States',
+    1941, 1959,
+    'MUSEUM_PIECE', 'STEAM', 'STANDARD', TRUE,
+    112, 4000, 548, 40,
+    'The world''s largest and most powerful steam locomotive ever built.',
+    'Built for Union Pacific Railroad to haul heavy freight over the Wasatch Mountains in Utah. Only 25 were ever made. The 4014 was restored to operation in 2019 after 60 years of static display.',
+    ARRAY[
+        'At 548 tonnes, it''s heavier than a fully loaded Boeing 747',
+        'The name "Big Boy" was scrawled by a worker during construction',
+        'Consumed 22 tonnes of coal and 75,000 liters of water per trip',
+        'The only Big Boy still operational in the world'
+    ],
+    'https://storage.brazilrail.com/audio/big_boy_start.mp3',
+    'audio/mpeg', 45,
+    41.2565, -111.0842, 'Ogden, Utah',
+    '{"wheel_arrangement": "4-8-8-4", "boiler_pressure_psi": 300, "cylinder_count": 4, "tractive_effort_lbf": 135375}',
+    u.id
+FROM users u WHERE u.username = 'rail_admin' LIMIT 1
 ON CONFLICT DO NOTHING;
 
-INSERT INTO consent_records (user_id, purpose, granted, policy_version, jurisdiction, consent_ip)
-SELECT id, 'location_tracking', TRUE, '2025-06', 'BR', '127.0.0.1'::inet
-FROM users WHERE role = 'ADMIN'
-LIMIT 1
+-- Trem 2: TGV Duplex — velocidade, europeu
+INSERT INTO train_models (
+    model_name, manufacturer, country_origin, year_introduced,
+    status, traction, gauge, is_legendary,
+    max_speed_kmh, power_kw, weight_tonnes, length_meters, passenger_capacity,
+    description, historical_context,
+    fun_facts,
+    factory_lat, factory_lng, factory_city,
+    technical_specs,
+    created_by
+)
+SELECT
+    'TGV Duplex',
+    'Alstom',
+    'France',
+    1996,
+    'ACTIVE', 'ELECTRIC', 'STANDARD', TRUE,
+    320, 8800, 380, 200, 508,
+    'Double-deck high-speed train, the backbone of French rail network.',
+    'Developed to increase passenger capacity on busy Paris routes without adding more trains. The double-deck design was revolutionary in high-speed rail.',
+    ARRAY[
+        'Can carry 508 passengers at 320 km/h',
+        'Uses regenerative braking to feed electricity back to the grid',
+        'The TGV holds the wheel-on-rail speed record: 574.8 km/h'
+    ],
+    47.3215, 5.0415, 'Dijon, France',
+    '{"voltage_v": 25000, "frequency_hz": 50, "bogies": "articulated", "pantograph": "single-arm"}',
+    u.id
+FROM users u WHERE u.username = 'rail_admin' LIMIT 1
 ON CONFLICT DO NOTHING;
+
+-- Trem 3: Maria Fumaça (E.F. Mogiana) — brasileiro, histórico
+INSERT INTO train_models (
+    model_name, manufacturer, country_origin, year_introduced, year_retired,
+    status, traction, gauge, is_legendary,
+    max_speed_kmh, weight_tonnes, length_meters,
+    description, historical_context,
+    fun_facts,
+    factory_lat, factory_lng, factory_city,
+    technical_specs,
+    created_by
+)
+SELECT
+    'Maria Fumaça — E.F. Mogiana',
+    'Baldwin Locomotive Works',
+    'Brazil',
+    1896, 1975,
+    'MUSEUM_PIECE', 'STEAM', 'NARROW', TRUE,
+    60, 45, 12,
+    'Iconic Brazilian steam locomotive that shaped the coffee-era economy of São Paulo state.',
+    'The Estrada de Ferro Mogiana was the backbone of São Paulo''s coffee economy in the late 19th and early 20th centuries. The Maria Fumaça (Smoky Mary) became a cultural symbol of Brazilian industrial heritage. Today, a restored unit operates tourist excursions between Campinas and Jaguariúna.',
+    ARRAY[
+        'The term "Maria Fumaça" became generic for any steam train in Brazil',
+        'The narrow gauge (1000mm) was chosen to reduce construction costs in rugged terrain',
+        'Transported 60% of Brazil''s coffee exports at its peak',
+        'A restored unit still operates tourist rides in São Paulo state'
+    ],
+    -22.9068, -47.0626, 'Campinas, SP, Brazil',
+    '{"wheel_arrangement": "2-8-0", "boiler_pressure_psi": 180, "fuel": "wood_or_coal", "gauge_mm": 1000}',
+    u.id
+FROM users u WHERE u.username = 'rail_admin' LIMIT 1
+ON CONFLICT DO NOTHING;
+
+-- Trem 4: Maglev SCMaglev — tecnologia de ponta para testar campos futuristas
+INSERT INTO train_models (
+    model_name, manufacturer, country_origin, year_introduced,
+    status, traction, gauge, is_legendary,
+    max_speed_kmh, power_kw, weight_tonnes, length_meters, passenger_capacity,
+    description, historical_context,
+    fun_facts,
+    factory_lat, factory_lng, factory_city,
+    technical_specs,
+    created_by
+)
+SELECT
+    'SCMaglev L0 Series',
+    'Central Japan Railway (JR Central)',
+    'Japan',
+    2013,
+    'PROTOTYPE', 'MAGLEV', 'DUAL', TRUE,
+    603, 30000, 325, 150, 900,
+    'World''s fastest train, holding the absolute speed record of 603 km/h.',
+    'Japan''s superconducting maglev uses liquid helium-cooled magnets to levitate 10mm above the guideway. The Chuo Shinkansen line between Tokyo and Osaka is under construction, targeting commercial operation in 2027.',
+    ARRAY[
+        'Holds the world speed record: 603 km/h achieved April 21, 2015',
+        'Levitates using superconducting magnets cooled to -269°C',
+        'Tokyo to Osaka (500km) will take only 67 minutes',
+        'No wheels touch the track — zero mechanical friction at speed'
+    ],
+    35.1815, 136.9066, 'Nagoya, Japan',
+    '{"levitation_height_mm": 10, "guideway_type": "U-shaped", "cooling": "liquid_helium", "superconducting": true, "frequency_hz": 0, "propulsion": "linear_induction_motor"}',
+    u.id
+FROM users u WHERE u.username = 'rail_admin' LIMIT 1
+ON CONFLICT DO NOTHING;
+
+-- ==============================================================================
+-- 6. COMENTÁRIOS PARA MONGODB E REDIS
+-- (Não são tabelas SQL — são schemas de documento/estruturas de chave)
+-- Documentados aqui para referência cruzada com os outros bancos
+-- ==============================================================================
+
+COMMENT ON TABLE users IS
+'PostgreSQL: fonte da verdade para autenticação e perfil.
+Redis: hash session:{userId} com campos {jwt, role, last_seen}.
+MongoDB: collection user_activity_log — eventos de navegação, uploads, buscas.';
+
+COMMENT ON TABLE train_models IS
+'PostgreSQL: fonte da verdade para dados estruturados dos trens.
+Redis: string cache:train:{id} (JSON serializado, TTL 300s) + set cache:train:list (TTL 60s).
+MongoDB: collection train_edit_history — cada UPDATE gera um documento com snapshot antes/depois.';
+
+COMMENT ON COLUMN train_models.technical_specs IS
+'JSONB flexível por tipo de tração.
+Steam: {wheel_arrangement, boiler_pressure_psi, tractive_effort_lbf}
+Electric: {voltage_v, frequency_hz, pantograph}
+Maglev: {levitation_height_mm, guideway_type, superconducting}
+Diesel: {engine_model, cylinders, transmission}';
+
+COMMENT ON COLUMN train_models.historical_route IS
+'Array de waypoints GeoJSON-like.
+Formato: [{"lat": -23.5, "lng": -46.6, "station": "Luz", "year": 1900}, ...]
+Indexado com GIN para queries como: historical_route @> ''[{"station": "Luz"}]''::jsonb';
+
+COMMENT ON COLUMN users.preferences IS
+'JSONB de preferências do usuário.
+Exemplo: {"theme": "dark", "language": "pt-BR", "notifications": true, "items_per_page": 20}';
