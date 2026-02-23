@@ -1,6 +1,10 @@
 version: '3.8'
 
 services:
+
+  # ============================================================
+  # PostgreSQL 16 — Fonte da verdade, CRUD principal
+  # ============================================================
   rail-db:
     image: postgres:16-alpine
     container_name: brazil_rail_db_container
@@ -12,7 +16,7 @@ services:
     ports:
       - "5434:5432"
     volumes:
-      - rail_system_data:/var/lib/postgresql/data
+      - rail_pg_data:/var/lib/postgresql/data
       - ./database/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U rail_admin -d brazil_rail_db"]
@@ -23,6 +27,9 @@ services:
     networks:
       - rail_network
 
+  # ============================================================
+  # pgAdmin 4 — UI para o PostgreSQL
+  # ============================================================
   rail-pgadmin:
     image: dpage/pgadmin4:latest
     container_name: brazil_rail_pgadmin
@@ -30,14 +37,21 @@ services:
       PGADMIN_DEFAULT_EMAIL: admin@brazilrail.com
       PGADMIN_DEFAULT_PASSWORD: admin
       PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
     ports:
       - "5051:80"
+    volumes:
+      - rail_pgadmin_data:/var/lib/pgadmin
     depends_on:
       rail-db:
         condition: service_healthy
+    restart: unless-stopped
     networks:
       - rail_network
 
+  # ============================================================
+  # Redis 7 — Session/JWT + Cache + Rate Limiting
+  # ============================================================
   rail-redis:
     image: redis:7-alpine
     container_name: brazil_rail_redis
@@ -45,17 +59,77 @@ services:
       - "6380:6379"
     volumes:
       - rail_redis_data:/data
-    command: redis-server --appendonly yes
+    command: redis-server --appendonly yes --requirepass rail_redis_007
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "rail_redis_007", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
     networks:
       - rail_network
 
+  # ============================================================
+  # MongoDB 7 — Histórico de edições + Activity logs
+  # ============================================================
+  rail-mongo:
+    image: mongo:7-jammy
+    container_name: brazil_rail_mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: rail_mongo_admin
+      MONGO_INITDB_ROOT_PASSWORD: rail_mongo_007
+      MONGO_INITDB_DATABASE: brazil_rail_mongo
+    ports:
+      - "27018:27017"
+    volumes:
+      - rail_mongo_data:/data/db
+      - ./database/mongo-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - rail_network
+
+  # ============================================================
+  # Mongo Express — UI para o MongoDB
+  # ============================================================
+  rail-mongo-express:
+    image: mongo-express:latest
+    container_name: brazil_rail_mongo_express
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: rail_mongo_admin
+      ME_CONFIG_MONGODB_ADMINPASSWORD: rail_mongo_007
+      ME_CONFIG_MONGODB_URL: mongodb://rail_mongo_admin:rail_mongo_007@rail-mongo:27017/
+      ME_CONFIG_BASICAUTH_USERNAME: admin
+      ME_CONFIG_BASICAUTH_PASSWORD: admin
+    ports:
+      - "8081:8081"
+    depends_on:
+      rail-mongo:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - rail_network
+
+# ============================================================
+# Volumes persistentes
+# ============================================================
 volumes:
-  rail_system_data:
+  rail_pg_data:
+    driver: local
+  rail_pgadmin_data:
     driver: local
   rail_redis_data:
     driver: local
+  rail_mongo_data:
+    driver: local
 
+# ============================================================
+# Rede isolada entre os serviços
+# ============================================================
 networks:
   rail_network:
     driver: bridge
